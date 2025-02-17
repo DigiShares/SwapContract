@@ -5,9 +5,10 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Multicall} from "openzeppelin-contracts/contracts/utils/Multicall.sol";
 import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
-import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {Ownable2Step, Ownable} from "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
+import {SafeCast} from "openzeppelin-contracts/contracts/utils/math/SafeCast.sol";
 
-contract SwapContract is Multicall, Ownable {
+contract SwapContract is Multicall, Ownable2Step {
     using SafeERC20 for IERC20;
 
     enum Status {
@@ -31,13 +32,14 @@ contract SwapContract is Multicall, Ownable {
         uint8 percentage;
     }
 
-    IPermit2 immutable permit2;
-    PercentageFee[] percentageFees;
-    uint32 swapExpiry;
+    IPermit2 public immutable permit2;
+    PercentageFee[] public percentageFees;
+    uint32 public swapExpiry;
 
-    mapping(address => mapping(string => Swap)) swaps;
-    mapping(address => bool) openingTokens;
-    mapping(address => bool) closingTokens;
+    mapping(address openingWallet => mapping(string swapId => Swap swap))
+        private swaps;
+    mapping(address => bool) public openingTokens;
+    mapping(address => bool) public closingTokens;
 
     event Opened(
         string indexed swapId,
@@ -57,6 +59,24 @@ contract SwapContract is Multicall, Ownable {
         address indexed openingToken,
         uint256 openingTokenAmount
     );
+
+    event SinglePermit(address indexed signer, address indexed spender);
+    event BatchPermit(address indexed signer, address indexed spender);
+    event OpeningTokenUpdated(address indexed token, bool indexed status);
+    event ClosingTokenUpdated(address indexed token, bool indexed status);
+    event PercentageFeeAdded(
+        address indexed recipient,
+        uint8 indexed percentage
+    );
+    event PercentageFeeRemoved(
+        address indexed recipient,
+        uint8 indexed percentage
+    );
+    event PercentageFeeUpdated(
+        address indexed recipient,
+        uint8 indexed percentage
+    );
+    event SwapExpiryUpdated(uint32 indexed swapExpiry);
 
     error ZeroAddressForbidden();
     error ZeroAmountForbidden();
@@ -102,6 +122,7 @@ contract SwapContract is Multicall, Ownable {
      * @dev reverts with `InvalidToken` if the tokens are invalid,
      * @dev reverts with `ZeroAddressForbidden` if the closing wallet address is zero,
      * @dev reverts with `ZeroAmountForbidden` if the token amounts are zero.
+     * @dev reverts with `InvalidClosingWallet` if the closing wallet is the same as the opening wallet.
      * @param _swapId The unique identifier for the swap.
      * @param _closingWallet The address of the wallet that will close the swap.
      * @param _openingToken The address of the token being offered in the swap.
@@ -123,6 +144,7 @@ contract SwapContract is Multicall, Ownable {
             revert InvalidToken();
         if (_openingTokenAmount == 0 || _closingTokenAmount == 0)
             revert ZeroAmountForbidden();
+        if (msg.sender == _closingWallet) revert InvalidClosingWallet();
 
         swaps[msg.sender][_swapId] = Swap({
             closingWallet: _closingWallet,
@@ -134,13 +156,14 @@ contract SwapContract is Multicall, Ownable {
             status: Status.OPEN
         });
 
+        emit Opened(_swapId, msg.sender, _openingToken, _openingTokenAmount);
+
         permit2.transferFrom(
             msg.sender,
             address(this),
-            uint160(_openingTokenAmount),
+            SafeCast.toUint160(_openingTokenAmount),
             _openingToken
         );
-        emit Opened(_swapId, msg.sender, _openingToken, _openingTokenAmount);
 
         return true;
     }
@@ -153,6 +176,7 @@ contract SwapContract is Multicall, Ownable {
      * @dev reverts with `SwapNotOpen` If the swap is not in an OPEN state.
      * @dev reverts with `IncorrectClosingWallet` If the caller is not the designated closing wallet.
      * @dev reverts with `SwapExpired` If the swap has expired.
+     * @dev reverts with `InvalidFee` If the fee is zero.
      * @dev reverts with `FeeExceededAmount` If the total fee amount exceeds the closing token amount.
      * @param _openingWallet The address of the wallet that opened the swap.
      * @param _swapId The unique identifier of the swap.
@@ -173,9 +197,10 @@ contract SwapContract is Multicall, Ownable {
 
         uint256 totalFee;
 
-        for (uint256 i; i < percentageFees.length; i++) {
-            uint256 fee = (swap.closingTokenAmount / 1000) *
-                percentageFees[i].percentage;
+        for (uint256 i; i < percentageFees.length; ++i) {
+            uint256 fee = (swap.closingTokenAmount *
+                percentageFees[i].percentage) / 1000;
+            if (fee == 0) revert InvalidFee();
             totalFee += fee / 2;
             permit2.transferFrom(
                 msg.sender,
@@ -187,23 +212,23 @@ contract SwapContract is Multicall, Ownable {
 
         if (totalFee > swap.closingTokenAmount) revert FeeExceededAmount();
 
+        emit Closed(
+            _swapId,
+            msg.sender,
+            swap.closingToken,
+            swap.closingTokenAmount
+        );
+
         permit2.transferFrom(
             msg.sender,
             _openingWallet,
-            uint160(swap.closingTokenAmount - totalFee),
+            SafeCast.toUint160(swap.closingTokenAmount - totalFee),
             swap.closingToken
         );
 
         IERC20(swap.openingToken).safeTransfer(
             msg.sender,
             swap.openingTokenAmount
-        );
-
-        emit Closed(
-            _swapId,
-            msg.sender,
-            swap.closingToken,
-            swap.closingTokenAmount
         );
 
         return true;
@@ -231,15 +256,15 @@ contract SwapContract is Multicall, Ownable {
 
         swaps[_openingWallet][_swapId].status = Status.EXPIRED;
 
-        IERC20(swap.openingToken).safeTransfer(
-            _openingWallet,
-            swap.openingTokenAmount
-        );
-
         emit Expired(
             _swapId,
             msg.sender,
             swap.openingToken,
+            swap.openingTokenAmount
+        );
+
+        IERC20(swap.openingToken).safeTransfer(
+            _openingWallet,
             swap.openingTokenAmount
         );
 
@@ -261,6 +286,7 @@ contract SwapContract is Multicall, Ownable {
 
     /**
      * @notice Executes a single permit operation.
+     * @dev emits a `SinglePermit` event when the single permit operation is successfully executed
      * @dev This function calls the permit method on the permit2 contract with the provided parameters.
      * @param _permitSingle The permit data containing details such as the spender and the amount.
      * @param _signature The signature authorizing the permit.
@@ -269,13 +295,15 @@ contract SwapContract is Multicall, Ownable {
     function singlePermit(
         IPermit2.PermitSingle calldata _permitSingle,
         bytes calldata _signature
-    ) public isValidSpender(_permitSingle.spender) returns (bool) {
+    ) external isValidSpender(_permitSingle.spender) returns (bool) {
+        emit SinglePermit(msg.sender, _permitSingle.spender);
         permit2.permit(msg.sender, _permitSingle, _signature);
         return true;
     }
 
     /**
      * @notice Executes a batch permit operation.
+     * @dev emits a `BatchPermit` event when the batch permit operation is successfully executed
      * @dev This function allows the caller to batch multiple permit operations in a single transaction.
      * @param _permitBatch The batch of permits to be executed.
      * @param _signature The signature authorizing the batch permit.
@@ -285,12 +313,14 @@ contract SwapContract is Multicall, Ownable {
         IPermit2.PermitBatch calldata _permitBatch,
         bytes calldata _signature
     ) external isValidSpender(_permitBatch.spender) returns (bool) {
+        emit BatchPermit(msg.sender, _permitBatch.spender);
         permit2.permit(msg.sender, _permitBatch, _signature);
         return true;
     }
 
     /**
      * @notice Updates the status of an opening token.
+     * @dev emits an `OpeningTokenUpdated` event when the opening token status is successfully updated.
      * @dev This function can only be called by the contract owner.
      * @dev reverts with `ZeroAddressForbidden` if the provided token address is the zero address.
      * @dev reverts with `TokenAddressMatchForbidden` if the provided token address is already listed as a closing token.
@@ -303,10 +333,12 @@ contract SwapContract is Multicall, Ownable {
     ) external isValidAddress(_token) onlyOwner {
         if (closingTokens[_token]) revert TokenAddressMatchForbidden();
         openingTokens[_token] = _status;
+        emit OpeningTokenUpdated(_token, _status);
     }
 
     /**
      * @notice Updates the status of a closing token.
+     * @dev emits a `ClosingTokenUpdated` event when the closing token status is successfully updated.
      * @dev This function can only be called by the owner of the contract.
      * @dev reverts with `ZeroAddressForbidden` if the provided token address is the zero address.
      * @dev reverts with `TokenAddressMatchForbidden` if the provided token address is already listed as an opening token.
@@ -319,10 +351,12 @@ contract SwapContract is Multicall, Ownable {
     ) external isValidAddress(_token) onlyOwner {
         if (openingTokens[_token]) revert TokenAddressMatchForbidden();
         closingTokens[_token] = _status;
+        emit ClosingTokenUpdated(_token, _status);
     }
 
     /**
      * @notice Updates the percentage fee for a given index.
+     * @dev emits a `PercentageFeeUpdated` event when the fee is successfully updated.
      * @dev This function can only be called by the owner of the contract.
      * @dev reverts with `ZeroAddressForbidden` if the provided recipient address is zero.
      * @dev reverts with `InvalidFee` if the provided percentage is above the treshold.
@@ -336,10 +370,12 @@ contract SwapContract is Multicall, Ownable {
         uint8 _percentage
     ) external isValidAddress(_recipient) onlyOwner {
         percentageFees[_index] = PercentageFee(_recipient, _percentage);
+        emit PercentageFeeUpdated(_recipient, _percentage);
     }
 
     /**
      * @notice Adds a new percentage fee to the list of percentage fees.
+     @ dev emits a `PercentageFeeAdded` event when the fee is successfully added.
      * @dev This function can only be called by the owner of the contract.
      * @dev reverts with `ZeroAddressForbidden` if the provided recipient address is zero.
      * @dev reverts with `InvalidFee` if the provided percentage is above the treshold.
@@ -351,10 +387,12 @@ contract SwapContract is Multicall, Ownable {
         uint8 _percentage
     ) external isValidAddress(_recipient) onlyOwner {
         percentageFees.push(PercentageFee(_recipient, _percentage));
+        emit PercentageFeeAdded(_recipient, _percentage);
     }
 
     /**
      * @notice Removes a percentage fee from the list of percentage fees.
+     * @dev emits a `PercentageFeeRemoved` event when the fee is successfully removed.
      * @dev This function can only be called by the owner of the contract.
      * It replaces the fee at the specified index with the last fee in the list
      * and then removes the last fee, effectively deleting the fee at the specified index.
@@ -363,14 +401,20 @@ contract SwapContract is Multicall, Ownable {
     function removePercentageFee(uint256 _index) external onlyOwner {
         percentageFees[_index] = percentageFees[percentageFees.length - 1];
         percentageFees.pop();
+        emit PercentageFeeRemoved(
+            percentageFees[_index].recipient,
+            percentageFees[_index].percentage
+        );
     }
 
     /**
      * @notice Updates the swap expiry time.
+     * @dev emits a `SwapExpiryUpdated` event when the swap expiry time is successfully updated.
      * @dev This function can only be called by the owner of the contract.
      * @param _swapExpiry The new expiry time for the swap.
      */
     function updateSwapExpiry(uint32 _swapExpiry) external onlyOwner {
         swapExpiry = _swapExpiry;
+        emit SwapExpiryUpdated(_swapExpiry);
     }
 }
